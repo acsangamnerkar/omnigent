@@ -243,9 +243,17 @@ def test_canonical_context_drops_empty_values() -> None:
     assert canonical_context_json({"a": "1", "b": ""}) == canonical_context_json({"a": "1"})
 
 
+def test_canonical_context_golden_bytes() -> None:
+    ctx = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
+    assert (
+        canonical_context_json(ctx)
+        == b'{"provider":"github","user_id":"alice","workspace_id":"0"}'
+    )
+
+
 def test_canonical_context_cannot_collide_distinct_identities() -> None:
-    # Review Focus 2: a value containing a delimiter must not collide two
-    # distinct identities onto the same AAD.
+    # A value containing a delimiter must not collide two distinct identities
+    # onto the same AAD.
     left = canonical_context_json({"provider": "github", "account_id": "a=b"})
     right = canonical_context_json({"provider": "github", "account_id": "a", "b": ""})
     assert left != right

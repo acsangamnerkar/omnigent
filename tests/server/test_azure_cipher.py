@@ -78,6 +78,38 @@ def test_split_key_id_rejects_malformed() -> None:
             _split_key_id(bad)
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://kv.vault.azure.net/keys/omnigent-credentials//9f8e7d",  # empty segment
+        "https://kv.vault.azure.net/keys//9f8e7d",  # empty key name
+        "https://kv.vault.azure.net/keys/omnigent-credentials/9f8e7d/extra",
+    ],
+)
+def test_split_key_id_rejects_empty_and_extra_segments(bad: str) -> None:
+    # A typo must fail at startup, not be read as some other key or version.
+    with pytest.raises(ValueError, match=CREDENTIAL_AZURE_KEY_ENV_VAR):
+        _split_key_id(bad)
+    with pytest.raises(ValueError, match=CREDENTIAL_AZURE_KEY_ENV_VAR):
+        AzureKeyVaultSecretCipher(bad, client_factory=_FakeVault().factory)
+
+
+def test_split_key_id_error_shows_the_version_as_required() -> None:
+    with pytest.raises(ValueError, match="keys/<name>/<version>,"):
+        _split_key_id("not-a-url")
+
+
+def test_stored_key_id_with_extra_segments_reads_as_disconnected() -> None:
+    # Inside decrypt the parser guards a stored id, so a malformed one is per-row.
+    vault = _FakeVault()
+    cipher = AzureKeyVaultSecretCipher(KEY_ID, client_factory=vault.factory)
+    unwrapped = _unwrap(cipher.encrypt("t", context=CTX_ALICE))
+    assert unwrapped is not None
+    _, iv, tag, blob = unwrapped
+    corrupt = _wrap(KEY_ID + "/extra", iv, tag, blob)
+    assert cipher.decrypt(corrupt, context=CTX_ALICE) is None
+
+
 CTX_ALICE = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
 CTX_BOB = {"workspace_id": "0", "user_id": "bob", "provider": "github", "account_id": ""}
 
@@ -267,6 +299,7 @@ def test_configured_key_case_and_slash_are_not_a_repoint() -> None:
     [
         ClientAuthenticationError(message="the identity cannot use this key"),
         ResourceNotFoundError(message="key or version not found"),
+        _http_error(403, "forbidden"),
         _http_error(429, "throttled"),
         _http_error(503, "service unavailable"),
     ],

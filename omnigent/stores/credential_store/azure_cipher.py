@@ -99,16 +99,24 @@ def _split_key_id(key_id: str) -> tuple[str, str, str | None]:
     """Split a key identifier into ``(vault_url, key_name, version)``.
 
     The vault URL is lowercased and any trailing slash dropped so a pasted or
-    differently-cased identifier is not mistaken for a different key.
+    differently-cased identifier is not mistaken for a different key. The version
+    is ``None`` only when the identifier has none at all; empty or extra path
+    segments are a typo and raise.
     """
     parts = key_id.strip().rstrip("/").split("/")
-    if len(parts) < 5 or parts[0].lower() not in ("https:", "http:") or parts[3] != "keys":
+    if (
+        len(parts) not in (5, 6)
+        or parts[0].lower() not in ("https:", "http:")
+        or parts[1] != ""
+        or parts[3] != "keys"
+        or not all(parts[2:])
+    ):
         raise ValueError(
             f"{CREDENTIAL_AZURE_KEY_ENV_VAR} must be a full Key Vault key identifier "
-            f"like https://<vault>.vault.azure.net/keys/<name>[/<version>], got {key_id!r}"
+            f"like https://<vault>.vault.azure.net/keys/<name>/<version>, got {key_id!r}"
         )
     vault_url = "/".join(parts[:3]).lower()
-    return vault_url, parts[4], parts[5] if len(parts) > 5 else None
+    return vault_url, parts[4], parts[5] if len(parts) == 6 else None
 
 
 class AzureKeyVaultSecretCipher:
