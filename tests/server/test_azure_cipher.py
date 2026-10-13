@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import (
+    ClientAuthenticationError,
+    HttpResponseError,
+    ResourceNotFoundError,
+)
 
 from omnigent.stores.credential_store.azure_cipher import (
     CREDENTIAL_AZURE_KEY_ENV_VAR,
@@ -186,3 +190,77 @@ def test_unversioned_key_id_is_rejected() -> None:
             "https://kv.vault.azure.net/keys/omnigent-credentials",
             client=_FakeCryptoClient("https://kv.vault.azure.net/keys/omnigent-credentials"),
         )
+
+
+OTHER_KEY_ID = "https://kv.vault.azure.net/keys/someone-elses-key/1a2b"
+ROTATED_KEY_ID = "https://kv.vault.azure.net/keys/omnigent-credentials/NEWVERSION"
+
+
+def test_key_repoint_raises_before_any_service_call() -> None:
+    """A store-wide key repoint must RAISE, not soft-fail to None.
+
+    The envelope carries its encrypting key, so decrypting under a differently
+    named configured key is detected as store-wide and raises before the
+    service is reached — it can never mask as a per-user reconnect, which would
+    re-encrypt under the wrong key and overwrite recoverable ciphertext.
+    """
+    written = _make_azure().encrypt("t", context=CTX_ALICE)
+    client = _FakeCryptoClient(OTHER_KEY_ID)
+    client.raise_on_decrypt = AssertionError("the service must not be called")
+    repointed = AzureKeyVaultSecretCipher(OTHER_KEY_ID, client=client)
+    with pytest.raises(ValueError, match="repointed"):
+        repointed.decrypt(written, context=CTX_ALICE)
+
+
+def test_key_version_difference_still_decrypts() -> None:
+    # Rotation must not orphan existing rows: only the version differs, so the
+    # stored identifier is honoured rather than treated as a repoint.
+    fake = _FakeCryptoClient(KEY_ID)
+    written = AzureKeyVaultSecretCipher(KEY_ID, client=fake).encrypt("t", context=CTX_ALICE)
+    rotated = AzureKeyVaultSecretCipher(ROTATED_KEY_ID, client=fake)
+    assert rotated.decrypt(written, context=CTX_ALICE) == "t"
+
+
+def test_configured_key_case_and_slash_are_not_a_repoint() -> None:
+    # A pasted or differently-cased identifier must not raise.
+    fake = _FakeCryptoClient(KEY_ID)
+    written = AzureKeyVaultSecretCipher(KEY_ID, client=fake).encrypt("t", context=CTX_ALICE)
+    sloppy = AzureKeyVaultSecretCipher(
+        "HTTPS://KV.Vault.Azure.Net/keys/omnigent-credentials/9f8e7d/", client=fake
+    )
+    assert sloppy.decrypt(written, context=CTX_ALICE) == "t"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientAuthenticationError(message="the identity cannot use this key"),
+        ResourceNotFoundError(message="key or version not found"),
+        _http_error(429, "throttled"),
+        _http_error(503, "service unavailable"),
+    ],
+)
+def test_operational_errors_propagate(error: Exception) -> None:
+    # Telling a user to reconnect would not help and would hide the fault.
+    fake = _FakeCryptoClient(KEY_ID)
+    cipher = AzureKeyVaultSecretCipher(KEY_ID, client=fake)
+    written = cipher.encrypt("t", context=CTX_ALICE)
+    fake.raise_on_decrypt = error
+    with pytest.raises(type(error)):
+        cipher.decrypt(written, context=CTX_ALICE)
+
+
+def test_non_aes_key_raises_loudly_on_first_encrypt() -> None:
+    # RSA/EC has no AAD parameter, so it cannot carry the binding. Never soft-fail.
+    cipher = _make_azure(key_type="RSA-HSM")
+    with pytest.raises(ValueError, match="AES"):
+        cipher.encrypt("t", context=CTX_ALICE)
+
+
+def test_foreign_backend_ciphertext_reconnects() -> None:
+    # The vault→azure migration path. Rows written by another
+    # backend read as disconnected, never as a crash.
+    cipher = _make_azure()
+    assert cipher.decrypt("osvault:b3RoZXI=:vault:v1:abcd", context=CTX_ALICE) is None
+    assert cipher.decrypt("AQICAHhwbG9iCg==", context=CTX_ALICE) is None
+    assert cipher.decrypt("", context=CTX_ALICE) is None
