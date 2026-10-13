@@ -1,18 +1,22 @@
-"""AWS KMS-backed encryption for integration secrets stored at rest.
+"""Encryption for integration secrets stored at rest, and the backend registry.
 
 Integration credentials (GitHub App tokens today; MCP connector secrets later)
-are encrypted before they touch the database. Encryption is delegated to AWS
-KMS: the key material never leaves KMS, and the server holds only an IAM
-permission to call ``Encrypt``/``Decrypt`` (granted via IRSA — no key or master
-secret lives in the process or its environment). Each secret is bound to its
-row's identity — ``(workspace_id, user_id, provider, account_id)`` — passed as
-the KMS *encryption context*, so a ciphertext can only be decrypted by
-presenting the same identity. That is per-user encryption enforced by KMS, not
-by a key the server derives, and there is no global-key path.
+are encrypted before they touch the database. Encryption is delegated to a
+managed key service, so key material never leaves it and the server holds only
+permission to call encrypt/decrypt — no key or master secret lives in the
+process or its environment. Each secret is bound to its row's identity —
+``(workspace_id, user_id, provider, account_id)`` — so a ciphertext can only be
+decrypted by presenting the same identity. That is per-user encryption enforced
+by the backend, not by a key the server derives, and there is no global-key path.
 
-A deployment selects the key with ``OMNIGENT_CREDENTIAL_KMS_KEY_ID``; unset ⇒
-the credential store, and every integration built on it, is disabled. There is
-no non-KMS fallback. See ``designs/CREDENTIAL_STORE.md``.
+Three backends implement the :class:`SecretCipher` port: AWS KMS
+(:class:`KmsSecretCipher`, below), Vault Transit
+(:mod:`~omnigent.stores.credential_store.vault_cipher`) and Azure Key Vault /
+Managed HSM (:mod:`~omnigent.stores.credential_store.azure_cipher`). A
+deployment selects one via :func:`build_secret_cipher`; configuring none
+disables the credential store and every integration built on it — the feature
+is off, not silently encrypting with a local key. See
+``designs/CREDENTIAL_STORE.md``.
 """
 
 from __future__ import annotations

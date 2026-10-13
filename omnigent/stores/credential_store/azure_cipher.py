@@ -34,7 +34,7 @@ from omnigent.stores.credential_store.secret_cipher import (
 _logger = logging.getLogger(__name__)
 
 #: Names the Key Vault / Managed HSM key used to encrypt integration secrets:
-#: the full identifier, ``https://<vault>.vault.azure.net/keys/<name>[/<ver>]``.
+#: the full identifier, ``https://<vault>.vault.azure.net/keys/<name>/<version>``.
 #: Unset ⇒ the Azure cipher is not selected.
 CREDENTIAL_AZURE_KEY_ENV_VAR = "OMNIGENT_CREDENTIAL_AZURE_KEY_ID"
 

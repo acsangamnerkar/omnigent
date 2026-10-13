@@ -64,7 +64,8 @@ effect on this design.
 ## Configuration
 
 - `OMNIGENT_CREDENTIAL_AZURE_KEY_ID` — the full key identifier,
-  `https://<vault>.vault.azure.net/keys/<name>[/<version>]`. Unset ⇒ the
+  `https://<vault>.vault.azure.net/keys/<name>/<version>`. The version is
+  required; an unversioned identifier is rejected at construction. Unset ⇒ the
   builder returns `None` and the backend is simply not selected, matching both
   existing builders' disabled-when-unset contract.
 - `OMNIGENT_CREDENTIAL_CIPHER=azure` — explicit selection, required only when
@@ -100,20 +101,24 @@ per-row failure (corrupt or foreign). The `1` is a format version,
 reserved so a future variant — an RSA-wrap path for Key Vault Standard, say —
 can coexist with rows already written rather than requiring a migration.
 
-`key_id` is the **resolved, versioned** identifier returned as
-`EncryptResult.key_id`, not the configured value. Two properties of that field
-are load-bearing and are confirmed during implementation: it is typed
-`str | None`, and this backend treats `None` — only reachable through a
-local `from_jwk` client, which it never constructs — by falling back to the
-configured identifier; and it is expected to carry the key version, as Key
-Vault's `kid` does. If it should return an unversioned identifier, the
-equivalent fix is to resolve the current version once at first use, or to
-require a versioned value in configuration. This matters: Key Vault
-decryption must use the exact key version that encrypted the data, and the
-ciphertext does not carry it. Storing the resolved id means a key rotated to a
-new version keeps decrypting existing rows under their original version while
-new rows use the current one — the transparent-rotation behavior KMS gets for
-free from its key-embedding blobs. Decryption builds a client for the stored
+`key_id` is the versioned identifier from configuration. The original design
+took it from `EncryptResult.key_id` as the service's resolved `kid`; measured
+against `azure-keyvault-keys` 4.11.2, `CryptographyClient.encrypt()` returns
+`EncryptResult(key_id=self.key_id, ...)`, the identifier passed to the
+constructor, and discards the `kid` in the response. Only a successful
+`get_key()` (the `keys/get` permission, deliberately not required here) replaces
+it with the versioned id, and the SDK swallows the resulting 403. An unversioned
+configured identifier would therefore be recorded unversioned in every envelope.
+The design requires a versioned identifier in configuration, which is the
+fallback this paragraph originally named; an unversioned one is rejected at
+construction. `EncryptResult.key_id` is typed `str | None`, and this backend
+falls back to the configured identifier on `None`. Key Vault decryption must
+use the exact key version that encrypted the data, and the ciphertext does not
+carry it, so the envelope records it. Rotating means pinning a new version in
+configuration: new rows use it, and existing rows keep decrypting under their
+original version, as the stored identifier is what decryption uses. This
+preserves the rotation behavior KMS gets from its key-embedding blobs, at the
+cost of a config change. Decryption builds a client for the stored
 identifier, cached per version.
 
 On decrypt, the stored identifier's vault host and key name are compared
