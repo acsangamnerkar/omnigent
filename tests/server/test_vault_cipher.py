@@ -23,6 +23,7 @@ from omnigent.stores.credential_store.secret_cipher import (
     KmsSecretCipher,
     SecretCipher,
     build_secret_cipher,
+    canonical_context_json,
 )
 from omnigent.stores.credential_store.vault_cipher import (
     CREDENTIAL_VAULT_KEY_ENV_VAR,
@@ -183,3 +184,33 @@ def test_autodetect_single_then_ambiguous(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv(CREDENTIAL_KMS_KEY_ENV_VAR, "alias/x")
     with pytest.raises(ValueError):  # both + no selector → ambiguous, no silent precedence
         build_secret_cipher()
+
+
+def test_canonical_context_is_order_independent() -> None:
+    a = canonical_context_json({"user_id": "alice", "workspace_id": "0"})
+    b = canonical_context_json({"workspace_id": "0", "user_id": "alice"})
+    assert a == b
+    assert isinstance(a, bytes)
+
+
+def test_canonical_context_drops_empty_values() -> None:
+    assert canonical_context_json({"a": "1", "b": ""}) == canonical_context_json({"a": "1"})
+
+
+def test_canonical_context_cannot_collide_distinct_identities() -> None:
+    # Review Focus 2: a value containing a delimiter must not collide two
+    # distinct identities onto the same AAD.
+    left = canonical_context_json({"provider": "github", "account_id": "a=b"})
+    right = canonical_context_json({"provider": "github", "account_id": "a", "b": ""})
+    assert left != right
+    nl = canonical_context_json({"account_id": "a\nprovider=x"})
+    assert nl != canonical_context_json({"account_id": "a", "provider": "x"})
+
+
+def test_vault_context_b64_matches_canonical() -> None:
+    import base64
+
+    from omnigent.stores.credential_store.vault_cipher import _context_b64
+
+    ctx = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
+    assert base64.b64decode(_context_b64(ctx)) == canonical_context_json(ctx)

@@ -18,6 +18,7 @@ no non-KMS fallback. See ``designs/CREDENTIAL_STORE.md``.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -28,6 +29,19 @@ _logger = logging.getLogger(__name__)
 #: A row's identity, passed as the encryption ``context`` so each
 #: ``(workspace, user, provider, account)`` is bound to its own ciphertext.
 SecretContext = Mapping[str, str]
+
+
+def canonical_context_json(context: SecretContext) -> bytes:
+    """Serialize the row identity to stable, unambiguous bytes.
+
+    Empty values are dropped so ``account_id=""`` and an absent account bind
+    identically. Sorted-key JSON keeps the encoding order-independent and makes
+    a value containing ``=`` or a newline unable to collide two distinct
+    identities, which a ``k=v``-joined string cannot guarantee.
+    """
+    items = {k: v for k, v in context.items() if v != ""}
+    return json.dumps(items, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
 
 #: Names the AWS KMS key (id, ARN, or ``alias/…``) used to encrypt integration
 #: secrets. Owned by the credential store, not any one provider, so every
