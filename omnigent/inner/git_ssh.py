@@ -62,6 +62,8 @@ def normalize_git_ssh_bindings(bindings: Sequence[GitSshBinding]) -> list[GitSsh
     """Apply the same validation to YAML and programmatic bindings."""
     from .git_ssh_policy import parse_git_ssh_bindings
 
+    if not bindings:
+        raise ValueError("Git SSH requires at least one binding")
     parsed = parse_git_ssh_bindings(
         [
             {
@@ -78,7 +80,9 @@ def normalize_git_ssh_bindings(bindings: Sequence[GitSshBinding]) -> list[GitSsh
             for binding in bindings
         ]
     )
-    return parsed or []
+    if parsed is None:
+        raise ValueError("Git SSH requires at least one binding")
+    return parsed
 
 
 def _parse_git_argv(argv: object, bindings: Sequence[GitSshBinding]) -> tuple[GitSshBinding, str]:
@@ -386,6 +390,18 @@ class GitSshBroker:
             raise
         quota = [0]
         quota_lock = threading.Lock()
+        quota_exceeded = threading.Event()
+
+        def deny_transfer() -> None:
+            with quota_lock:
+                if quota_exceeded.is_set():
+                    return
+                quota_exceeded.set()
+                transferred = quota[0]
+            logger.warning("Git SSH transfer limit exceeded after %s bytes", transferred)
+            _signal_ssh_group(process, signal.SIGTERM)
+            with contextlib.suppress(OSError):
+                _write_frame(sock, b"D", b"Git SSH transfer limit exceeded", write_lock)
 
         def pump_input() -> None:
             try:
@@ -397,8 +413,10 @@ class GitSshBroker:
                         raise GitSshDenied("Unexpected Git SSH input frame")
                     with quota_lock:
                         quota[0] += len(frame[1])
-                        if quota[0] > _MAX_TRANSFER:
-                            raise GitSshDenied("Git SSH transfer limit exceeded")
+                        over_limit = quota[0] > _MAX_TRANSFER
+                    if over_limit:
+                        deny_transfer()
+                        break
                     process.stdin.write(frame[1])
                     process.stdin.flush()
             except (OSError, ValueError, GitSshDenied):
@@ -412,9 +430,12 @@ class GitSshBroker:
                 while chunk := os.read(stream.fileno(), _MAX_FRAME):
                     with quota_lock:
                         quota[0] += len(chunk)
-                        if quota[0] > _MAX_TRANSFER:
-                            _signal_ssh_group(process, signal.SIGTERM)
-                            break
+                        over_limit = quota[0] > _MAX_TRANSFER
+                    if over_limit:
+                        deny_transfer()
+                        break
+                    if quota_exceeded.is_set():
+                        break
                     _write_frame(sock, kind, chunk, write_lock)
             except OSError:
                 _signal_ssh_group(process, signal.SIGTERM)

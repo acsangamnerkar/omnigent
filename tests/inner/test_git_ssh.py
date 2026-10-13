@@ -51,6 +51,33 @@ def broker_dir() -> Iterator[Path]:
         yield Path(folder)
 
 
+def test_git_ssh_empty_programmatic_bindings_fail_loudly(broker_dir: Path) -> None:
+    with pytest.raises(ValueError, match="at least one binding"):
+        start_git_ssh_broker([], broker_dir)
+
+
+def test_git_ssh_transfer_limit_reports_denial(
+    ssh_git_server: tuple[GitSshBinding, str, Path],
+    broker_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding, url, _ = ssh_git_server
+    monkeypatch.setattr("omnigent.inner.git_ssh._MAX_TRANSFER", 1)
+    broker = start_git_ssh_broker([binding], broker_dir)
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", url],
+            env=_git_env(broker),
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        assert result.returncode != 0
+        assert "Git SSH transfer limit exceeded" in result.stderr
+    finally:
+        broker.stop()
+
+
 def test_git_ssh_broker_fetch_and_denials(
     ssh_git_server: tuple[GitSshBinding, str, Path], tmp_path: Path, broker_dir: Path
 ) -> None:
