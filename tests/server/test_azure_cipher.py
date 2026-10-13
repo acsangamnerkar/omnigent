@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any
 
 import pytest
@@ -408,3 +409,14 @@ def test_real_client_path_is_cached_per_version(monkeypatch: pytest.MonkeyPatch)
     assert cipher._crypto_for(V1_KEY_ID) is first
     cipher._crypto_for(V2_KEY_ID)
     assert built == [V1_KEY_ID, V2_KEY_ID]
+
+
+def test_missing_sdk_names_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without omnigent[azure], both paths must say what to install, not "no module azure".
+    cipher = _make_azure()
+    written = cipher.encrypt("t", context=CTX_ALICE)
+    monkeypatch.setitem(sys.modules, "azure.core.exceptions", None)
+    with pytest.raises(ImportError, match=r"omnigent\[azure\]"):
+        cipher.encrypt("t", context=CTX_ALICE)
+    with pytest.raises(ImportError, match=r"omnigent\[azure\]"):
+        cipher.decrypt(written, context=CTX_ALICE)

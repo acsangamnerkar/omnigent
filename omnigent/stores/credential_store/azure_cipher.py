@@ -25,14 +25,26 @@ import base64
 import logging
 import os
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.stores.credential_store.secret_cipher import (
     SecretContext,
     canonical_context_json,
 )
 
+if TYPE_CHECKING:
+    from azure.core.exceptions import (
+        ClientAuthenticationError,
+        HttpResponseError,
+        ResourceNotFoundError,
+    )
+
 _logger = logging.getLogger(__name__)
+
+_MISSING_SDK = (
+    "The Azure credential backend needs the Azure SDKs. Install them "
+    "with `pip install 'omnigent[azure]'`."
+)
 
 #: Names the Key Vault / Managed HSM key used to encrypt integration secrets:
 #: the full identifier, ``https://<vault>.vault.azure.net/keys/<name>/<version>``.
@@ -93,6 +105,21 @@ def _unwrap(stored: str) -> tuple[str, bytes, bytes, bytes] | None:
         )
     except (ValueError, UnicodeDecodeError):
         return None
+
+
+def _azure_errors() -> tuple[
+    type[ClientAuthenticationError], type[HttpResponseError], type[ResourceNotFoundError]
+]:
+    """Import the SDK's exception types, failing with the install hint if absent."""
+    try:
+        from azure.core.exceptions import (
+            ClientAuthenticationError,
+            HttpResponseError,
+            ResourceNotFoundError,
+        )
+    except ImportError as exc:
+        raise ImportError(_MISSING_SDK) from exc
+    return ClientAuthenticationError, HttpResponseError, ResourceNotFoundError
 
 
 def _split_key_id(key_id: str) -> tuple[str, str, str | None]:
@@ -160,10 +187,7 @@ class AzureKeyVaultSecretCipher:
             from azure.identity import DefaultAzureCredential
             from azure.keyvault.keys.crypto import CryptographyClient
         except ImportError as exc:  # pragma: no cover - import guard
-            raise ImportError(
-                "The Azure credential backend needs the Azure SDKs. Install them "
-                "with `pip install 'omnigent[azure]'`."
-            ) from exc
+            raise ImportError(_MISSING_SDK) from exc
 
         if self._credential is None:
             self._credential = DefaultAzureCredential()
@@ -172,11 +196,7 @@ class AzureKeyVaultSecretCipher:
         return client
 
     def encrypt(self, plaintext: str, *, context: SecretContext) -> str:
-        from azure.core.exceptions import (
-            ClientAuthenticationError,
-            HttpResponseError,
-            ResourceNotFoundError,
-        )
+        ClientAuthenticationError, HttpResponseError, ResourceNotFoundError = _azure_errors()
 
         client = self._crypto_for(self._key_id)
         try:
@@ -218,11 +238,7 @@ class AzureKeyVaultSecretCipher:
         writing a new secret, would read a non-AES key's 400 as per-row, since
         only the encrypt path can tell the two apart.
         """
-        from azure.core.exceptions import (
-            ClientAuthenticationError,
-            HttpResponseError,
-            ResourceNotFoundError,
-        )
+        ClientAuthenticationError, HttpResponseError, ResourceNotFoundError = _azure_errors()
 
         unwrapped = _unwrap(ciphertext)
         if unwrapped is None:
