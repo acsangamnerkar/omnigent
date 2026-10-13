@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 from typing import Any
 
 from omnigent.stores.credential_store.secret_cipher import (
@@ -254,3 +255,15 @@ class AzureKeyVaultSecretCipher:
             )
             return None
         return result.plaintext.decode("utf-8")
+
+
+def build_azure_secret_cipher() -> AzureKeyVaultSecretCipher | None:
+    """Construct the Azure Key Vault cipher from deployment config, or ``None``.
+
+    Reads ``OMNIGENT_CREDENTIAL_AZURE_KEY_ID``; unset ⇒ ``None``, mirroring the
+    other builders' disabled-when-unset contract. A malformed identifier raises
+    here rather than on the first encrypt, so a config typo surfaces at startup.
+    The Azure SDKs stay lazy: this reads env and constructs only.
+    """
+    key_id = os.environ.get(CREDENTIAL_AZURE_KEY_ENV_VAR, "").strip()
+    return AzureKeyVaultSecretCipher(key_id) if key_id else None

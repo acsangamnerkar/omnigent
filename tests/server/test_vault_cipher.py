@@ -18,6 +18,10 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError
 
+from omnigent.stores.credential_store.azure_cipher import (
+    CREDENTIAL_AZURE_KEY_ENV_VAR,
+    AzureKeyVaultSecretCipher,
+)
 from omnigent.stores.credential_store.secret_cipher import (
     CREDENTIAL_CIPHER_ENV_VAR,
     CREDENTIAL_KMS_KEY_ENV_VAR,
@@ -38,6 +42,7 @@ CTX_BOB = {"workspace_id": "0", "user_id": "bob", "provider": "github", "account
 VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
 VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "devroot")
 VAULT_KEY = os.environ.get("OMNIGENT_CREDENTIAL_VAULT_KEY", "omnigent-cred")
+AZURE_KEY_ID = "https://kv.vault.azure.net/keys/omnigent-credentials/9f8e7d"
 
 
 class _FakeKmsClient:
@@ -157,6 +162,7 @@ def _clear_backend_env(mp: pytest.MonkeyPatch) -> None:
         CREDENTIAL_CIPHER_ENV_VAR,
         CREDENTIAL_KMS_KEY_ENV_VAR,
         CREDENTIAL_VAULT_KEY_ENV_VAR,
+        CREDENTIAL_AZURE_KEY_ENV_VAR,
     ):
         mp.delenv(var, raising=False)
 
@@ -189,6 +195,38 @@ def test_autodetect_single_then_ambiguous(monkeypatch: pytest.MonkeyPatch) -> No
     assert isinstance(build_secret_cipher(), VaultSecretCipher)  # single → that one
     monkeypatch.setenv(CREDENTIAL_KMS_KEY_ENV_VAR, "alias/x")
     with pytest.raises(ValueError):  # both + no selector → ambiguous, no silent precedence
+        build_secret_cipher()
+
+
+def test_azure_selector_picks_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_CIPHER_ENV_VAR, "azure")
+    monkeypatch.setenv(CREDENTIAL_AZURE_KEY_ENV_VAR, AZURE_KEY_ID)
+    assert isinstance(build_secret_cipher(), AzureKeyVaultSecretCipher)
+
+
+def test_azure_selector_requires_its_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_CIPHER_ENV_VAR, "azure")
+    with pytest.raises(ValueError):
+        build_secret_cipher()
+
+
+def test_azure_autodetects_and_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_AZURE_KEY_ENV_VAR, AZURE_KEY_ID)
+    assert isinstance(build_secret_cipher(), AzureKeyVaultSecretCipher)  # single → that one
+    monkeypatch.setenv(CREDENTIAL_VAULT_KEY_ENV_VAR, "omnigent-cred")
+    with pytest.raises(ValueError):  # two configured, no selector → ambiguous
+        build_secret_cipher()
+
+
+def test_azure_malformed_key_id_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A typo in config must fail at build with a message naming the env var,
+    # not produce a confusing SDK error on the first encrypt.
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_AZURE_KEY_ENV_VAR, "kv.vault.azure.net/omnigent-cred")
+    with pytest.raises(ValueError, match=CREDENTIAL_AZURE_KEY_ENV_VAR):
         build_secret_cipher()
 
 
