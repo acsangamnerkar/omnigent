@@ -111,8 +111,10 @@ it with the versioned id, and the SDK swallows the resulting 403. An unversioned
 configured identifier would therefore be recorded unversioned in every envelope.
 The design requires a versioned identifier in configuration, which is the
 fallback this paragraph originally named; an unversioned one is rejected at
-construction. `EncryptResult.key_id` is typed `str | None`, and this backend
-falls back to the configured identifier on `None`. Key Vault decryption must
+construction. The envelope records the configured identifier itself rather
+than `EncryptResult.key_id`, which the SDK respells to the service's `kid`
+whenever `get_key()` succeeds. Note too that `EncryptResult` takes the GCM tag
+as its `authentication_tag` keyword but stores it as `.tag`. Key Vault decryption must
 use the exact key version that encrypted the data, and the ciphertext does not
 carry it, so the envelope records it. Rotating means pinning a new version in
 configuration: new rows use it, and existing rows keep decrypting under their
@@ -147,16 +149,19 @@ reconnect would not help and would hide a misconfiguration:
 - Throttling (429) and 5xx.
 - A non-AES key, see below.
 
-**This section carries the design's one genuine unknown.** The exact HTTP
-status and service error code Key Vault returns for a GCM tag or AAD mismatch
-must be confirmed against a live Premium vault before merge. Implementation
-keys the per-row signal off `HttpResponseError.status_code == 400`; if 400 also
-covers conditions that are *not* per-row (a wrong algorithm for the key type,
-for instance), the discriminator narrows to the service's structured error
-code. Matching on an error-message substring is explicitly rejected as the
-primary discriminator — `vault_cipher` documents that exact fragility, where a
-wrong context and a wrong key arrive as the same 400 and a substring check
-cannot separate them.
+**Measured against a live vault.** On Key Vault Premium with an `oct-HSM`
+AES-256 key, called by an identity holding only `keys/encrypt` and
+`keys/decrypt`, an AES-GCM decrypt whose AAD does not match fails with
+`HttpResponseError` status 400, service error code `BadParameter` ("Unable to
+decrypt specified value with this key"). A tampered tag, a tampered
+ciphertext, a wrong nonce, and a swapped nonce and tag all fail identically.
+Every 400 this decrypt can produce is therefore a per-row condition, and the
+per-row signal stays keyed on `HttpResponseError.status_code == 400`.
+Narrowing it to `BadParameter` would add nothing: the non-AES-key 400 the
+spec worried about arises on encrypt, which never soft-fails. Matching on an
+error-message substring remains rejected as the discriminator — `vault_cipher`
+documents that exact fragility, where a wrong context and a wrong key arrive as
+the same 400 and a substring check cannot separate them.
 
 ## Non-AES keys
 
