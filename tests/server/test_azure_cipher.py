@@ -8,6 +8,7 @@ import pytest
 from azure.core.exceptions import HttpResponseError
 
 from omnigent.stores.credential_store.azure_cipher import (
+    CREDENTIAL_AZURE_KEY_ENV_VAR,
     AzureKeyVaultSecretCipher,
     _split_key_id,
     _unwrap,
@@ -175,3 +176,13 @@ def test_oversized_plaintext_raises() -> None:
     cipher = _make_azure()
     with pytest.raises(ValueError, match="single-block"):
         cipher.encrypt("x" * (FAKE_BLOCK_LIMIT + 1), context=CTX_ALICE)
+
+
+def test_unversioned_key_id_is_rejected() -> None:
+    # Without keys/get the SDK reports the configured id, not the version that
+    # encrypted, so an unversioned id would orphan every row on rotation.
+    with pytest.raises(ValueError, match=CREDENTIAL_AZURE_KEY_ENV_VAR):
+        AzureKeyVaultSecretCipher(
+            "https://kv.vault.azure.net/keys/omnigent-credentials",
+            client=_FakeCryptoClient("https://kv.vault.azure.net/keys/omnigent-credentials"),
+        )

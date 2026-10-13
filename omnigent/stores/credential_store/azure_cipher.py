@@ -112,9 +112,11 @@ def _split_key_id(key_id: str) -> tuple[str, str, str | None]:
 class AzureKeyVaultSecretCipher:
     """:class:`SecretCipher` backed by Key Vault / Managed HSM AES-GCM.
 
-    :param key_id: Full key identifier. A version is recommended but optional;
-        the version that actually encrypted each row is recorded in its
-        envelope, so rotating to a new version leaves existing rows readable.
+    :param key_id: Full key identifier, **including the version**. Without
+        ``keys/get`` the SDK reports the configured identifier rather than the
+        version that actually encrypted, so the version must be pinned in config.
+        Rotating means updating the configured version; rows written under
+        earlier versions keep decrypting because each envelope records its own.
     :param client: Optional pre-built ``CryptographyClient`` (tests inject a
         fake); otherwise built lazily per key version, so importing this module
         never requires the Azure SDKs or a credential.
@@ -122,7 +124,13 @@ class AzureKeyVaultSecretCipher:
 
     def __init__(self, key_id: str, *, client: Any | None = None) -> None:
         self._key_id = key_id.strip().rstrip("/")
-        self._vault_url, self._key_name, _ = _split_key_id(self._key_id)
+        self._vault_url, self._key_name, version = _split_key_id(self._key_id)
+        if version is None:
+            raise ValueError(
+                f"{CREDENTIAL_AZURE_KEY_ENV_VAR} must include the key version, like "
+                "https://<vault>.vault.azure.net/keys/<name>/<version>, so each row "
+                f"records the version that encrypted it; got {key_id!r}"
+            )
         self._injected = client
         self._clients: dict[str, Any] = {}
         self._credential: Any | None = None
