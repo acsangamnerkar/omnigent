@@ -94,6 +94,10 @@ and steers messages while the agent is busy.
   selects the agent, which stays listed after a reload. A rejected bundle (for
   example a server agent's name) keeps the dialog open with the server's reason.
 
+**Fork dialog** (Fork in the session header menu, or Fork from here on a
+message, with a native target): the same model, effort, and permission mode
+pickers, seeded from the source session when its harness family is kept.
+
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
 
@@ -144,6 +148,11 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
+- **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
+  permission-mode picker has component coverage in
+  `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort
+  pickers by hand: fork a Codex session, pick another effort in the dialog, and
+  expect the new session's pill to show it. See [sessions](./sessions.md).
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
 - **`attachments`:**
@@ -191,7 +200,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 
 - The in-session and new-session composers are different surfaces. A change to
   the pill, tooltip, configuration menu, or effort picker in one does not reach
-  the other. Verify both, plus the mobile layout.
+  the other. Verify both, plus the mobile layout. The Fork dialog repeats the
+  model, effort, and permission-mode pickers for native targets; check it too.
 - "New session" in a test name can mean a session with no turns yet, not the
   landing page. Check which surface the test opens.
 - Tooltip changes need a hover after the picker closes, not only on first load.
