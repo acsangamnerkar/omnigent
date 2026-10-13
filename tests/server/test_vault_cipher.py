@@ -208,8 +208,10 @@ def test_azure_selector_picks_backend(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_azure_selector_requires_its_key(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_backend_env(monkeypatch)
     monkeypatch.setenv(CREDENTIAL_CIPHER_ENV_VAR, "azure")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="key is unset") as excinfo:
         build_secret_cipher()
+    # A known selector with no key, not an unregistered backend.
+    assert "not a known credential" not in str(excinfo.value)
 
 
 def test_azure_autodetects_and_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
