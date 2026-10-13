@@ -99,10 +99,10 @@ The key identifier (`OMNIGENT_CREDENTIAL_AZURE_KEY_ID`) must include its
 version, `https://<vault>.vault.azure.net/keys/<name>/<version>`; an unversioned
 identifier is rejected at startup. To rotate, create a new key version and set
 the identifier to it. Rows written under earlier versions keep decrypting,
-because each envelope records the version that encrypted it. The version has to
-be pinned because, without `keys/get`, the SDK reports the identifier you
-configured rather than the version that encrypted, and a bare identifier would
-then resolve to the new version after rotation and fail to read old rows.
+because each envelope records the version that encrypted it. The version is
+required because the envelope records the configured identifier: an unversioned
+identifier would record no encrypting version, so rows written before a rotation
+could not be decrypted after it.
 
 `build_secret_cipher()` is the single seam where a deployment selects the
 backend. Each backend has a **store-level** key env var:
@@ -166,7 +166,10 @@ identity that holds Key Vault Crypto User (or the Managed HSM equivalent) on the
 one credential key. No Azure credentials sit in the pod; the key identifier is
 passed as plain config (`OMNIGENT_CREDENTIAL_AZURE_KEY_ID`), not a secret.
 
-Only `keys/encrypt` and `keys/decrypt` are required; `keys/get` is not. Set
+Only `keys/encrypt` and `keys/decrypt` are required; `keys/get` is not. Key
+Vault Crypto User does grant it, in which case the SDK makes one extra `get_key`
+round trip per client on first use; that is harmless, and the stored envelope
+does not depend on it. Set
 `AZURE_CLIENT_ID` explicitly: `DefaultAzureCredential` walks several credential
 sources in order and, on a cluster with more than one usable identity, can
 otherwise bind to an unintended one.
@@ -262,6 +265,14 @@ credential store — or uses another backend — needs none of them.
 server; the chosen backend's key env var is then required. Leave it unset to
 auto-detect the single configured backend — configuring more than one without the
 selector is an error (no silent precedence), and configuring none disables the store.
+
+**Switching backends.** Changing `OMNIGENT_CREDENTIAL_CIPHER` (say from `vault` to
+`azure`) has no migration: the new backend cannot read rows the previous one
+wrote, so every integration reads as disconnected until its user reconnects, and
+each reconnect overwrites that user's old ciphertext. Switching back restores
+only the rows nobody has reconnected yet. Plan a switch as a forced reconnect of
+every integration, announce it to users, and keep the old key available until
+you are sure you will not roll back.
 
 ## MCP auth & roadmap
 
