@@ -12,6 +12,7 @@ from azure.core.exceptions import (
     HttpResponseError,
     ResourceNotFoundError,
 )
+from azure.keyvault.keys.crypto import DecryptResult, EncryptionAlgorithm, EncryptResult
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -176,7 +177,13 @@ class _FakeCryptoClient:
         sealed = AESGCM(self._vault.key_for(self.key_id)).encrypt(
             nonce, plaintext, additional_authenticated_data
         )
-        return _FakeEncryptResult(self.key_id, sealed[:-16], nonce, sealed[-16:])
+        return EncryptResult(
+            key_id=self.key_id,
+            algorithm=EncryptionAlgorithm.a256_gcm,
+            ciphertext=sealed[:-16],
+            iv=nonce,
+            authentication_tag=sealed[-16:],
+        )
 
     def decrypt(
         self,
@@ -197,20 +204,7 @@ class _FakeCryptoClient:
             )
         except InvalidTag:
             raise _http_error(400, "the authentication tag could not be verified") from None
-        return _FakeDecryptResult(plaintext)
-
-
-class _FakeEncryptResult:
-    def __init__(self, key_id: str, ciphertext: bytes, iv: bytes, tag: bytes) -> None:
-        self.key_id = key_id
-        self.ciphertext = ciphertext
-        self.iv = iv
-        self.authentication_tag = tag
-
-
-class _FakeDecryptResult:
-    def __init__(self, plaintext: bytes) -> None:
-        self.plaintext = plaintext
+        return DecryptResult(self.key_id, EncryptionAlgorithm.a256_gcm, plaintext)
 
 
 def _make_azure(*, key_type: str = "oct-HSM") -> AzureKeyVaultSecretCipher:

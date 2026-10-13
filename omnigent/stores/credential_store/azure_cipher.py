@@ -221,7 +221,8 @@ class AzureKeyVaultSecretCipher:
                 ) from exc
             raise
         # Record the configured versioned id: the SDK may respell result.key_id.
-        return _wrap(self._key_id, result.iv, result.authentication_tag, result.ciphertext)
+        # EncryptResult stores the GCM tag as `.tag`; `authentication_tag` is only its kwarg.
+        return _wrap(self._key_id, result.iv, result.tag, result.ciphertext)
 
     def decrypt(self, ciphertext: str, *, context: SecretContext) -> str | None:
         """Return the plaintext, or ``None`` when the ciphertext/context is unusable.
