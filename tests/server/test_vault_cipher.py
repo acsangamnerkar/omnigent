@@ -1,12 +1,13 @@
-"""Verify the ``SecretCipher`` PORT works for BOTH AWS KMS and Vault Transit.
+"""Verify the ``SecretCipher`` PORT works for AWS KMS, Vault Transit and Azure Key Vault.
 
-One behavioral contract, parametrized over two backends:
-  - ``KmsSecretCipher`` with an in-memory fake KMS client (no AWS), and
-  - ``VaultSecretCipher`` against a live Vault dev server (localhost:8200).
+One behavioral contract, parametrized over three backends:
+  - ``KmsSecretCipher`` with an in-memory fake KMS client (no AWS),
+  - ``VaultSecretCipher`` against a live Vault dev server (localhost:8200), and
+  - ``AzureKeyVaultSecretCipher`` with an in-memory fake crypto client (no Azure).
 
-If both pass the same assertions, the port abstraction genuinely generalizes
-rather than being KMS-shaped. The Vault params skip cleanly when no dev server
-is reachable. Requires a Transit key created with ``derived=true``.
+If all three pass the same assertions, the port abstraction genuinely
+generalizes rather than being KMS-shaped. The Vault params skip cleanly when no
+dev server is reachable. Requires a Transit key created with ``derived=true``.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from omnigent.stores.credential_store.vault_cipher import (
     CREDENTIAL_VAULT_KEY_ENV_VAR,
     VaultSecretCipher,
 )
+from tests.server.test_azure_cipher import _make_azure
 
 CTX_ALICE = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
 CTX_BOB = {"workspace_id": "0", "user_id": "bob", "provider": "github", "account_id": ""}
@@ -78,9 +80,13 @@ def _make_vault() -> SecretCipher:
     return VaultSecretCipher(VAULT_KEY, client=client)
 
 
-@pytest.fixture(params=["kms", "vault"])
+@pytest.fixture(params=["kms", "vault", "azure"])
 def cipher(request: pytest.FixtureRequest) -> SecretCipher:
-    return _make_kms() if request.param == "kms" else _make_vault()
+    if request.param == "kms":
+        return _make_kms()
+    if request.param == "azure":
+        return _make_azure()
+    return _make_vault()
 
 
 def test_satisfies_port(cipher: SecretCipher) -> None:

@@ -23,6 +23,12 @@ from __future__ import annotations
 
 import base64
 import logging
+from typing import Any
+
+from omnigent.stores.credential_store.secret_cipher import (
+    SecretContext,
+    canonical_context_json,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -101,3 +107,142 @@ def _split_key_id(key_id: str) -> tuple[str, str, str | None]:
         )
     vault_url = "/".join(parts[:3]).lower()
     return vault_url, parts[4], parts[5] if len(parts) > 5 else None
+
+
+class AzureKeyVaultSecretCipher:
+    """:class:`SecretCipher` backed by Key Vault / Managed HSM AES-GCM.
+
+    :param key_id: Full key identifier. A version is recommended but optional;
+        the version that actually encrypted each row is recorded in its
+        envelope, so rotating to a new version leaves existing rows readable.
+    :param client: Optional pre-built ``CryptographyClient`` (tests inject a
+        fake); otherwise built lazily per key version, so importing this module
+        never requires the Azure SDKs or a credential.
+    """
+
+    def __init__(self, key_id: str, *, client: Any | None = None) -> None:
+        self._key_id = key_id.strip().rstrip("/")
+        self._vault_url, self._key_name, _ = _split_key_id(self._key_id)
+        self._injected = client
+        self._clients: dict[str, Any] = {}
+        self._credential: Any | None = None
+
+    def _crypto_for(self, key_id: str) -> Any:
+        """Return a client for *key_id*, one per version, created on first use."""
+        if self._injected is not None:
+            return self._injected
+        cached = self._clients.get(key_id)
+        if cached is not None:
+            return cached
+        try:
+            from azure.identity import DefaultAzureCredential
+            from azure.keyvault.keys.crypto import CryptographyClient
+        except ImportError as exc:  # pragma: no cover - import guard
+            raise ImportError(
+                "The Azure credential backend needs the Azure SDKs. Install them "
+                "with `pip install 'omnigent[azure]'`."
+            ) from exc
+
+        if self._credential is None:
+            self._credential = DefaultAzureCredential()
+        client = CryptographyClient(key_id, credential=self._credential)
+        self._clients[key_id] = client
+        return client
+
+    def encrypt(self, plaintext: str, *, context: SecretContext) -> str:
+        from azure.core.exceptions import (
+            ClientAuthenticationError,
+            HttpResponseError,
+            ResourceNotFoundError,
+        )
+
+        client = self._crypto_for(self._key_id)
+        try:
+            result = client.encrypt(
+                _ALGORITHM,
+                plaintext.encode("utf-8"),
+                additional_authenticated_data=canonical_context_json(context),
+            )
+        except (ClientAuthenticationError, ResourceNotFoundError):
+            raise
+        except HttpResponseError as exc:
+            # Encrypt has no per-row soft-fail path, so a 400 always raises. The
+            # two plausible causes are a non-AES key (RSA/EC cannot carry the
+            # binding) and an over-limit payload; name both and keep the
+            # service's own message.
+            if exc.status_code == 400:
+                raise ValueError(
+                    f"azure key vault: the key named by {CREDENTIAL_AZURE_KEY_ENV_VAR} "
+                    f"rejected {_ALGORITHM}. It must be an AES key (oct on Managed HSM, "
+                    "oct-HSM on Key Vault Premium), and the secret must fit the "
+                    f"service's single-block limit. Service said: {exc}"
+                ) from exc
+            raise
+        key_id = getattr(result, "key_id", None) or self._key_id
+        return _wrap(key_id, result.iv, result.authentication_tag, result.ciphertext)
+
+    def decrypt(self, ciphertext: str, *, context: SecretContext) -> str | None:
+        """Return the plaintext, or ``None`` when the ciphertext/context is unusable.
+
+        Degrades to ``None`` (⇒ reconnect, never a wrong plaintext) only for
+        per-row failures: an unrecognized envelope (corrupt, or written by
+        another backend), and a 400 from the service once the key name matches,
+        which is a failed authentication tag — a wrong row identity or a
+        corrupt blob. Store-wide failures propagate instead: a repointed key
+        raises *before* the service is called, and auth, not-found, throttling
+        and server errors raise too, because masking any of them as a per-user
+        reconnect would re-encrypt under the wrong key and overwrite
+        recoverable ciphertext. Residual gap: a store that only decrypts, never
+        writing a new secret, would read a non-AES key's 400 as per-row, since
+        only the encrypt path can tell the two apart.
+        """
+        from azure.core.exceptions import (
+            ClientAuthenticationError,
+            HttpResponseError,
+            ResourceNotFoundError,
+        )
+
+        unwrapped = _unwrap(ciphertext)
+        if unwrapped is None:
+            _logger.warning(
+                "azure key vault: ciphertext is not a recognized envelope "
+                "(corrupt, or written by another backend) — the affected integration "
+                "will read as disconnected until reconnected"
+            )
+            return None
+        stored_key_id, iv, tag, blob = unwrapped
+        try:
+            stored_vault, stored_name, _ = _split_key_id(stored_key_id)
+        except ValueError:
+            _logger.warning(
+                "azure key vault: ciphertext carries an unparseable key identifier "
+                "(corrupt) — the affected integration will read as disconnected"
+            )
+            return None
+        if (stored_vault, stored_name) != (self._vault_url, self._key_name):
+            raise ValueError(
+                f"azure key vault: ciphertext was written under key {stored_key_id!r} "
+                f"but the configured key is {self._key_id!r} — refusing to read "
+                f"({CREDENTIAL_AZURE_KEY_ENV_VAR} repointed?)"
+            )
+        try:
+            result = self._crypto_for(stored_key_id).decrypt(
+                _ALGORITHM,
+                blob,
+                iv=iv,
+                authentication_tag=tag,
+                additional_authenticated_data=canonical_context_json(context),
+            )
+        except (ClientAuthenticationError, ResourceNotFoundError):
+            raise
+        except HttpResponseError as exc:
+            if exc.status_code != 400:
+                raise
+            _logger.warning(
+                "azure key vault: could not decrypt (wrong row identity or corrupt) — "
+                "the affected integration will read as disconnected until "
+                "reconnected: %s",
+                exc,
+            )
+            return None
+        return result.plaintext.decode("utf-8")
