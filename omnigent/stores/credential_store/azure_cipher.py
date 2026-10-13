@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+from collections.abc import Callable
 from typing import Any
 
 from omnigent.stores.credential_store.secret_cipher import (
@@ -118,12 +119,14 @@ class AzureKeyVaultSecretCipher:
         version that actually encrypted, so the version must be pinned in config.
         Rotating means updating the configured version; rows written under
         earlier versions keep decrypting because each envelope records its own.
-    :param client: Optional pre-built ``CryptographyClient`` (tests inject a
-        fake); otherwise built lazily per key version, so importing this module
+    :param client_factory: Optional callable taking a key identifier and
+        returning a ``CryptographyClient``-shaped object (tests inject a fake).
+        Otherwise a real ``CryptographyClient`` is built lazily. Either way one
+        client is created per key version and cached, so importing this module
         never requires the Azure SDKs or a credential.
     """
 
-    def __init__(self, key_id: str, *, client: Any | None = None) -> None:
+    def __init__(self, key_id: str, *, client_factory: Callable[[str], Any] | None = None) -> None:
         self._key_id = key_id.strip().rstrip("/")
         self._vault_url, self._key_name, version = _split_key_id(self._key_id)
         if version is None:
@@ -132,17 +135,19 @@ class AzureKeyVaultSecretCipher:
                 "https://<vault>.vault.azure.net/keys/<name>/<version>, so each row "
                 f"records the version that encrypted it; got {key_id!r}"
             )
-        self._injected = client
+        self._client_factory = client_factory
         self._clients: dict[str, Any] = {}
         self._credential: Any | None = None
 
     def _crypto_for(self, key_id: str) -> Any:
         """Return a client for *key_id*, one per version, created on first use."""
-        if self._injected is not None:
-            return self._injected
         cached = self._clients.get(key_id)
         if cached is not None:
             return cached
+        if self._client_factory is not None:
+            client = self._client_factory(key_id)
+            self._clients[key_id] = client
+            return client
         try:
             from azure.identity import DefaultAzureCredential
             from azure.keyvault.keys.crypto import CryptographyClient
@@ -187,8 +192,8 @@ class AzureKeyVaultSecretCipher:
                     f"service's single-block limit. Service said: {exc}"
                 ) from exc
             raise
-        key_id = getattr(result, "key_id", None) or self._key_id
-        return _wrap(key_id, result.iv, result.authentication_tag, result.ciphertext)
+        # Record the configured versioned id: the SDK may respell result.key_id.
+        return _wrap(self._key_id, result.iv, result.authentication_tag, result.ciphertext)
 
     def decrypt(self, ciphertext: str, *, context: SecretContext) -> str | None:
         """Return the plaintext, or ``None`` when the ciphertext/context is unusable.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pytest
@@ -10,6 +11,8 @@ from azure.core.exceptions import (
     HttpResponseError,
     ResourceNotFoundError,
 )
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from omnigent.stores.credential_store.azure_cipher import (
     CREDENTIAL_AZURE_KEY_ENV_VAR,
@@ -90,21 +93,37 @@ def _http_error(status: int, message: str) -> HttpResponseError:
     return err
 
 
-class _FakeCryptoClient:
-    """In-memory CryptographyClient: decrypt succeeds only under the same AAD.
+class _FakeVault:
+    """In-memory Key Vault holding one real AES-256 key per key version.
 
-    Mirrors ``_FakeKmsClient`` in test_vault_cipher.py — it compares the AAD
-    rather than performing real AES-GCM.
+    Keys are created on first use, so distinct versions have distinct keys and a
+    row encrypted under one version decrypts only under that version.
     """
 
-    def __init__(self, key_id: str, *, key_type: str = "oct-HSM") -> None:
-        self.key_id = key_id
+    def __init__(self, *, key_type: str = "oct-HSM") -> None:
         self._key_type = key_type
-        self._store: dict[bytes, tuple[bytes, bytes]] = {}
-        self._n = 0
-        # Widened beyond HttpResponseError: Task 4 assigns an AssertionError to
-        # prove the service is never reached on a key repoint.
+        self._keys: dict[tuple[str, str, str | None], bytes] = {}
+        #: Every key id a client was created for, in order.
+        self.requested: list[str] = []
+        #: Raised by every decrypt when set: an operational fault or a tripwire.
         self.raise_on_decrypt: BaseException | None = None
+
+    def key_for(self, key_id: str) -> bytes:
+        # Normalize like the service: host case and trailing slashes don't matter.
+        return self._keys.setdefault(_split_key_id(key_id), AESGCM.generate_key(bit_length=256))
+
+    def factory(self, key_id: str) -> _FakeCryptoClient:
+        self.requested.append(key_id)
+        return _FakeCryptoClient(key_id, self, key_type=self._key_type)
+
+
+class _FakeCryptoClient:
+    """CryptographyClient stand-in that performs real AES-256-GCM."""
+
+    def __init__(self, key_id: str, vault: _FakeVault, *, key_type: str = "oct-HSM") -> None:
+        self.key_id = key_id
+        self._vault = vault
+        self._key_type = key_type
 
     def encrypt(
         self,
@@ -120,10 +139,11 @@ class _FakeCryptoClient:
             raise _http_error(400, f"algorithm {algorithm} is not supported for key type")
         if len(plaintext) > FAKE_BLOCK_LIMIT:
             raise _http_error(400, "the request payload exceeds the maximum block size")
-        self._n += 1
-        blob = f"ct-{self._n}".encode()
-        self._store[blob] = (additional_authenticated_data or b"", plaintext)
-        return _FakeEncryptResult(self.key_id, blob, b"iv-%d" % self._n, b"tag-%d" % self._n)
+        nonce = os.urandom(12)
+        sealed = AESGCM(self._vault.key_for(self.key_id)).encrypt(
+            nonce, plaintext, additional_authenticated_data
+        )
+        return _FakeEncryptResult(self.key_id, sealed[:-16], nonce, sealed[-16:])
 
     def decrypt(
         self,
@@ -134,12 +154,17 @@ class _FakeCryptoClient:
         authentication_tag: bytes | None = None,
         additional_authenticated_data: bytes | None = None,
     ) -> Any:
-        if self.raise_on_decrypt is not None:
-            raise self.raise_on_decrypt
-        entry = self._store.get(ciphertext)
-        if entry is None or entry[0] != (additional_authenticated_data or b""):
-            raise _http_error(400, "the authentication tag could not be verified")
-        return _FakeDecryptResult(entry[1])
+        assert algorithm == "A256GCM"
+        if self._vault.raise_on_decrypt is not None:
+            raise self._vault.raise_on_decrypt
+        assert iv is not None and authentication_tag is not None
+        try:
+            plaintext = AESGCM(self._vault.key_for(self.key_id)).decrypt(
+                iv, ciphertext + authentication_tag, additional_authenticated_data
+            )
+        except InvalidTag:
+            raise _http_error(400, "the authentication tag could not be verified") from None
+        return _FakeDecryptResult(plaintext)
 
 
 class _FakeEncryptResult:
@@ -156,7 +181,7 @@ class _FakeDecryptResult:
 
 
 def _make_azure(*, key_type: str = "oct-HSM") -> AzureKeyVaultSecretCipher:
-    return AzureKeyVaultSecretCipher(KEY_ID, client=_FakeCryptoClient(KEY_ID, key_type=key_type))
+    return AzureKeyVaultSecretCipher(KEY_ID, client_factory=_FakeVault(key_type=key_type).factory)
 
 
 def test_roundtrip_and_binding() -> None:
@@ -188,7 +213,7 @@ def test_unversioned_key_id_is_rejected() -> None:
     with pytest.raises(ValueError, match=CREDENTIAL_AZURE_KEY_ENV_VAR):
         AzureKeyVaultSecretCipher(
             "https://kv.vault.azure.net/keys/omnigent-credentials",
-            client=_FakeCryptoClient("https://kv.vault.azure.net/keys/omnigent-credentials"),
+            client_factory=_FakeVault().factory,
         )
 
 
@@ -205,28 +230,34 @@ def test_key_repoint_raises_before_any_service_call() -> None:
     re-encrypt under the wrong key and overwrite recoverable ciphertext.
     """
     written = _make_azure().encrypt("t", context=CTX_ALICE)
-    client = _FakeCryptoClient(OTHER_KEY_ID)
-    client.raise_on_decrypt = AssertionError("the service must not be called")
-    repointed = AzureKeyVaultSecretCipher(OTHER_KEY_ID, client=client)
+    vault = _FakeVault()
+    vault.raise_on_decrypt = AssertionError("the service must not be called")
+    repointed = AzureKeyVaultSecretCipher(OTHER_KEY_ID, client_factory=vault.factory)
     with pytest.raises(ValueError, match="repointed"):
         repointed.decrypt(written, context=CTX_ALICE)
+    assert vault.requested == []
 
 
 def test_key_version_difference_still_decrypts() -> None:
     # Rotation must not orphan existing rows: only the version differs, so the
     # stored identifier is honoured rather than treated as a repoint.
-    fake = _FakeCryptoClient(KEY_ID)
-    written = AzureKeyVaultSecretCipher(KEY_ID, client=fake).encrypt("t", context=CTX_ALICE)
-    rotated = AzureKeyVaultSecretCipher(ROTATED_KEY_ID, client=fake)
+    vault = _FakeVault()
+    written = AzureKeyVaultSecretCipher(KEY_ID, client_factory=vault.factory).encrypt(
+        "t", context=CTX_ALICE
+    )
+    rotated = AzureKeyVaultSecretCipher(ROTATED_KEY_ID, client_factory=vault.factory)
     assert rotated.decrypt(written, context=CTX_ALICE) == "t"
 
 
 def test_configured_key_case_and_slash_are_not_a_repoint() -> None:
     # A pasted or differently-cased identifier must not raise.
-    fake = _FakeCryptoClient(KEY_ID)
-    written = AzureKeyVaultSecretCipher(KEY_ID, client=fake).encrypt("t", context=CTX_ALICE)
+    vault = _FakeVault()
+    written = AzureKeyVaultSecretCipher(KEY_ID, client_factory=vault.factory).encrypt(
+        "t", context=CTX_ALICE
+    )
     sloppy = AzureKeyVaultSecretCipher(
-        "HTTPS://KV.Vault.Azure.Net/keys/omnigent-credentials/9f8e7d/", client=fake
+        "HTTPS://KV.Vault.Azure.Net/keys/omnigent-credentials/9f8e7d/",
+        client_factory=vault.factory,
     )
     assert sloppy.decrypt(written, context=CTX_ALICE) == "t"
 
@@ -242,10 +273,10 @@ def test_configured_key_case_and_slash_are_not_a_repoint() -> None:
 )
 def test_operational_errors_propagate(error: Exception) -> None:
     # Telling a user to reconnect would not help and would hide the fault.
-    fake = _FakeCryptoClient(KEY_ID)
-    cipher = AzureKeyVaultSecretCipher(KEY_ID, client=fake)
+    vault = _FakeVault()
+    cipher = AzureKeyVaultSecretCipher(KEY_ID, client_factory=vault.factory)
     written = cipher.encrypt("t", context=CTX_ALICE)
-    fake.raise_on_decrypt = error
+    vault.raise_on_decrypt = error
     with pytest.raises(type(error)):
         cipher.decrypt(written, context=CTX_ALICE)
 
@@ -264,3 +295,83 @@ def test_foreign_backend_ciphertext_reconnects() -> None:
     assert cipher.decrypt("osvault:b3RoZXI=:vault:v1:abcd", context=CTX_ALICE) is None
     assert cipher.decrypt("AQICAHhwbG9iCg==", context=CTX_ALICE) is None
     assert cipher.decrypt("", context=CTX_ALICE) is None
+
+
+V1_KEY_ID = "https://kv.vault.azure.net/keys/omnigent-credentials/v1"
+V2_KEY_ID = "https://kv.vault.azure.net/keys/omnigent-credentials/v2"
+
+
+def test_rotation_decrypts_under_the_stored_version() -> None:
+    # After rotating to v2, a row written under v1 must be decrypted with the v1
+    # key; v1 and v2 hold different keys, so routing to v2 cannot succeed.
+    vault = _FakeVault()
+    written = AzureKeyVaultSecretCipher(V1_KEY_ID, client_factory=vault.factory).encrypt(
+        "ghu_v1_token", context=CTX_ALICE
+    )
+    rotated = AzureKeyVaultSecretCipher(V2_KEY_ID, client_factory=vault.factory)
+    before = len(vault.requested)
+    assert rotated.decrypt(written, context=CTX_ALICE) == "ghu_v1_token"
+    assert vault.requested[before:] == [V1_KEY_ID]
+    # New rows go to the rotated version.
+    assert _unwrap(rotated.encrypt("ghu_v2_token", context=CTX_ALICE)) is not None
+    assert vault.requested[-1] == V2_KEY_ID
+
+
+def test_envelope_records_the_configured_versioned_key_id() -> None:
+    # Decryption must use the exact encrypting version, so the envelope keeps it.
+    cipher = AzureKeyVaultSecretCipher(V1_KEY_ID, client_factory=_FakeVault().factory)
+    unwrapped = _unwrap(cipher.encrypt("t", context=CTX_ALICE))
+    assert unwrapped is not None
+    assert unwrapped[0] == V1_KEY_ID
+
+
+def test_envelope_ignores_the_sdk_reported_key_id() -> None:
+    # With keys/get the SDK may report the service's spelling of the key id; the
+    # envelope must still carry the configured one so the repoint gate stays quiet.
+    vault = _FakeVault()
+
+    class _RespellingClient(_FakeCryptoClient):
+        def encrypt(self, *args: Any, **kwargs: Any) -> Any:
+            result = super().encrypt(*args, **kwargs)
+            result.key_id = "https://kv.vault.azure.net:443/keys/Omnigent-Credentials/v1"
+            return result
+
+    def respelling_factory(key_id: str) -> _FakeCryptoClient:
+        return _RespellingClient(key_id, vault)
+
+    cipher = AzureKeyVaultSecretCipher(V1_KEY_ID, client_factory=respelling_factory)
+    unwrapped = _unwrap(cipher.encrypt("t", context=CTX_ALICE))
+    assert unwrapped is not None
+    assert unwrapped[0] == V1_KEY_ID
+
+
+def test_one_client_per_key_version() -> None:
+    vault = _FakeVault()
+    written = AzureKeyVaultSecretCipher(V1_KEY_ID, client_factory=vault.factory).encrypt(
+        "t", context=CTX_ALICE
+    )
+    reader = AzureKeyVaultSecretCipher(V2_KEY_ID, client_factory=vault.factory)
+    before = len(vault.requested)
+    assert reader.decrypt(written, context=CTX_ALICE) == "t"
+    assert reader.decrypt(written, context=CTX_ALICE) == "t"
+    assert vault.requested[before:] == [V1_KEY_ID]
+
+
+def test_real_client_path_is_cached_per_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without a factory the cipher builds real SDK clients, also one per version.
+    import azure.identity
+    import azure.keyvault.keys.crypto
+
+    built: list[str] = []
+
+    class _StubClient:
+        def __init__(self, key_id: str, *, credential: Any) -> None:
+            built.append(key_id)
+
+    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda: object())
+    monkeypatch.setattr(azure.keyvault.keys.crypto, "CryptographyClient", _StubClient)
+    cipher = AzureKeyVaultSecretCipher(V2_KEY_ID)
+    first = cipher._crypto_for(V1_KEY_ID)
+    assert cipher._crypto_for(V1_KEY_ID) is first
+    cipher._crypto_for(V2_KEY_ID)
+    assert built == [V1_KEY_ID, V2_KEY_ID]
